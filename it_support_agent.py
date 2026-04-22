@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 from openai import OpenAI
+import gradio as gr
 
 
 MODEL_GPT = "gpt-4o-mini"
@@ -18,48 +19,62 @@ Rules:
 """.strip()
 
 
-def build_messages(user_issue: str):
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+def normalize_history(history):
+    """
+    Convert Gradio history into plain OpenAI chat messages.
+    Gradio history items usually look like:
+    {"role": "user"|"assistant", "content": "..."}
+    """
+    messages = []
+
+    for item in history:
+        role = item.get("role")
+        content = item.get("content")
+
+        # Keep only plain text content for this simple chatbot
+        if isinstance(content, str) and role in {"user", "assistant"}:
+            messages.append({"role": role, "content": content})
+
+    return messages
+
+
+def build_messages(message: str, history):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(normalize_history(history))
+    messages.append(
         {
             "role": "user",
-            "content": f"User issue: {user_issue}\n\nPlease troubleshoot this as an IT support specialist.",
-        },
-    ]
+            "content": f"User issue: {message}\n\nPlease troubleshoot this as an IT support specialist.",
+        }
+    )
+    return messages
 
 
-def ask_it_agent(client: OpenAI, user_issue: str) -> str:
+def ask_it_agent(client: OpenAI, message: str, history) -> str:
     response = client.chat.completions.create(
         model=MODEL_GPT,
-        messages=build_messages(user_issue),
+        messages=build_messages(message, history),
         temperature=0.3,
     )
     return response.choices[0].message.content or "I could not generate a response."
 
 
-def main():
-    load_dotenv()
-    client = OpenAI()
-
-    print("IT Support Agent (type 'exit' to quit)\n")
-    while True:
-        try:
-            issue = input("Describe your IT issue: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye.")
-            break
-        if not issue:
-            print("Please enter a problem description.\n")
-            continue
-        if issue.lower() in {"exit", "quit"}:
-            print("Goodbye.")
-            break
-
-        print("\nIT Agent Response:\n")
-        answer = ask_it_agent(client, issue)
-        print(answer)
-        print("\n" + "-" * 60 + "\n")
+def chat(message, history):
+    return ask_it_agent(client, message, history)
 
 
-if __name__ == "__main__":
-    main()
+load_dotenv()
+client = OpenAI()
+
+demo = gr.ChatInterface(
+    fn=chat,
+    title="IT Support Agent",
+    description="Describe your IT issue and get troubleshooting help.",
+    examples=[
+        "My laptop is connected to Wi-Fi but the internet is not working.",
+        "Outlook keeps asking for my password.",
+        "My printer shows offline even though it is turned on.",
+    ],
+)
+
+demo.launch()
