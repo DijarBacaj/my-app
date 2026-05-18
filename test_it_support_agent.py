@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from types import SimpleNamespace
@@ -22,6 +23,20 @@ class FakeCompletions:
 class FakeClient:
     def __init__(self):
         self.chat = SimpleNamespace(completions=FakeCompletions())
+
+
+class FakeOllamaResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
 
 
 class ITSupportAgentTests(unittest.TestCase):
@@ -122,11 +137,60 @@ class ITSupportAgentTests(unittest.TestCase):
         self.assertIn("too long", response)
         self.assertIn("500 characters", response)
 
-    def test_chat_handles_missing_api_key_without_importing_openai(self):
-        with patch.dict(os.environ, {}, clear=True):
+    def test_openai_provider_handles_missing_api_key_without_importing_openai(self):
+        with patch.dict(os.environ, {"AI_PROVIDER": "openai"}, clear=True):
             response = agent.chat("My Wi-Fi is down.", [])
 
         self.assertIn("Missing `OPENAI_API_KEY`", response)
+
+    def test_auto_provider_uses_ollama_when_openai_key_is_missing(self):
+        calls = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(
+                {
+                    "url": request.full_url,
+                    "timeout": timeout,
+                    "payload": json.loads(request.data.decode("utf-8")),
+                }
+            )
+            return FakeOllamaResponse(
+                {"message": {"role": "assistant", "content": "Use local steps."}}
+            )
+
+        with patch.dict(
+            os.environ,
+            {
+                "AI_PROVIDER": "auto",
+                "OLLAMA_MODEL": "llama3.2",
+                "MAX_RESPONSE_TOKENS": "256",
+            },
+            clear=True,
+        ):
+            response = agent.chat(
+                "My printer is offline.", [], ollama_urlopen_func=fake_urlopen
+            )
+
+        self.assertEqual(response, "Use local steps.")
+        self.assertEqual(calls[0]["url"], "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(calls[0]["timeout"], 120)
+        self.assertEqual(calls[0]["payload"]["model"], "llama3.2")
+        self.assertIs(calls[0]["payload"]["stream"], False)
+        self.assertEqual(calls[0]["payload"]["options"]["num_predict"], 256)
+
+    def test_resolve_provider_prefers_openai_when_key_exists_in_auto_mode(self):
+        with patch.dict(os.environ, {"AI_PROVIDER": "auto", "OPENAI_API_KEY": "sk-test"}):
+            self.assertEqual(agent.resolve_provider(), "openai")
+
+        with patch.dict(os.environ, {"AI_PROVIDER": "ollama"}, clear=True):
+            self.assertEqual(agent.resolve_provider(), "ollama")
+
+    def test_invalid_provider_fails_without_calling_any_model(self):
+        with patch.dict(os.environ, {"AI_PROVIDER": "olama"}, clear=True):
+            response = agent.chat("My Wi-Fi is down.", [])
+
+        self.assertIn("Unsupported `AI_PROVIDER`", response)
+        self.assertIn("auto", response)
 
     def test_ask_it_agent_sends_messages_to_openai_client(self):
         fake_client = FakeClient()
@@ -152,7 +216,9 @@ class ITSupportAgentTests(unittest.TestCase):
         def broken_client_factory():
             raise RuntimeError("provider secret detail")
 
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=True):
+        with patch.dict(
+            os.environ, {"AI_PROVIDER": "openai", "OPENAI_API_KEY": "sk-test"}, clear=True
+        ):
             with patch.object(agent.LOGGER, "exception"):
                 response = agent.chat(
                     "Outlook will not open.", [], client_factory=broken_client_factory
@@ -162,6 +228,20 @@ class ITSupportAgentTests(unittest.TestCase):
         self.assertNotIn("provider secret detail", response)
         self.assertNotIn("RuntimeError", response)
 
+    def test_ollama_runtime_error_has_local_setup_guidance(self):
+        def broken_urlopen(request, timeout):
+            raise OSError("local socket detail")
+
+        with patch.dict(os.environ, {"AI_PROVIDER": "ollama"}, clear=True):
+            with patch.object(agent.LOGGER, "exception"):
+                response = agent.chat(
+                    "Outlook will not open.", [], ollama_urlopen_func=broken_urlopen
+                )
+
+        self.assertIn("local Ollama service", response)
+        self.assertIn("ollama pull", response)
+        self.assertNotIn("local socket detail", response)
+
     def test_get_server_port_uses_safe_default_for_invalid_values(self):
         with patch.dict(os.environ, {"GRADIO_SERVER_PORT": "not-a-port"}, clear=True):
             self.assertEqual(agent.get_server_port(), 7860)
@@ -170,11 +250,15 @@ class ITSupportAgentTests(unittest.TestCase):
             self.assertEqual(agent.get_server_port(), 7861)
 
     def test_get_max_response_tokens_clamps_to_safe_range(self):
-        with patch.dict(os.environ, {"OPENAI_MAX_RESPONSE_TOKENS": "50"}, clear=True):
+        with patch.dict(os.environ, {"MAX_RESPONSE_TOKENS": "50"}, clear=True):
             self.assertEqual(agent.get_max_response_tokens(), 128)
 
-        with patch.dict(os.environ, {"OPENAI_MAX_RESPONSE_TOKENS": "9999"}, clear=True):
+        with patch.dict(os.environ, {"MAX_RESPONSE_TOKENS": "9999"}, clear=True):
             self.assertEqual(agent.get_max_response_tokens(), 2000)
+
+    def test_get_max_response_tokens_accepts_legacy_openai_name(self):
+        with patch.dict(os.environ, {"OPENAI_MAX_RESPONSE_TOKENS": "256"}, clear=True):
+            self.assertEqual(agent.get_max_response_tokens(), 256)
 
 
 if __name__ == "__main__":

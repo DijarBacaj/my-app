@@ -1,15 +1,24 @@
+import json
 import logging
 import os
 import re
+import urllib.error
+import urllib.request
 from typing import Any
 
 
 DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_PROVIDER = "auto"
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_MODEL = "llama3.2"
+DEFAULT_OLLAMA_KEEP_ALIVE = "5m"
+DEFAULT_OLLAMA_TIMEOUT_SECONDS = 120
 MAX_HISTORY_MESSAGES = 16
 DEFAULT_MAX_INPUT_CHARS = 4000
 DEFAULT_MAX_RESPONSE_TOKENS = 600
 MIN_RESPONSE_TOKENS = 128
 MAX_RESPONSE_TOKENS_LIMIT = 2000
+SUPPORTED_PROVIDERS = {"auto", "ollama", "openai"}
 
 LOGGER = logging.getLogger(__name__)
 
@@ -278,17 +287,62 @@ def get_model_name() -> str:
     return os.getenv("OPENAI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
 
+def get_provider_setting() -> str:
+    return os.getenv("AI_PROVIDER", DEFAULT_PROVIDER).strip().lower() or DEFAULT_PROVIDER
+
+
+def is_supported_provider(provider: str) -> bool:
+    return provider in SUPPORTED_PROVIDERS
+
+
+def resolve_provider() -> str:
+    provider = get_provider_setting()
+    if not is_supported_provider(provider):
+        raise ValueError(f"Unsupported provider: {provider}")
+
+    if provider != "auto":
+        return provider
+
+    if os.getenv("OPENAI_API_KEY"):
+        return "openai"
+    return "ollama"
+
+
+def get_ollama_base_url() -> str:
+    base_url = os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL).strip()
+    return (base_url or DEFAULT_OLLAMA_BASE_URL).rstrip("/")
+
+
+def get_ollama_model_name() -> str:
+    return os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL).strip() or DEFAULT_OLLAMA_MODEL
+
+
+def get_ollama_keep_alive() -> str:
+    return (
+        os.getenv("OLLAMA_KEEP_ALIVE", DEFAULT_OLLAMA_KEEP_ALIVE).strip()
+        or DEFAULT_OLLAMA_KEEP_ALIVE
+    )
+
+
+def get_ollama_timeout_seconds() -> int:
+    return clamp_int_env("OLLAMA_TIMEOUT_SECONDS", DEFAULT_OLLAMA_TIMEOUT_SECONDS, 5, 600)
+
+
 def get_max_input_chars() -> int:
     return clamp_int_env("MAX_INPUT_CHARS", DEFAULT_MAX_INPUT_CHARS, 500, 12000)
 
 
 def get_max_response_tokens() -> int:
-    return clamp_int_env(
-        "OPENAI_MAX_RESPONSE_TOKENS",
-        DEFAULT_MAX_RESPONSE_TOKENS,
-        MIN_RESPONSE_TOKENS,
-        MAX_RESPONSE_TOKENS_LIMIT,
-    )
+    raw_value = os.getenv(
+        "MAX_RESPONSE_TOKENS",
+        os.getenv("OPENAI_MAX_RESPONSE_TOKENS", str(DEFAULT_MAX_RESPONSE_TOKENS)),
+    ).strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return DEFAULT_MAX_RESPONSE_TOKENS
+
+    return min(max(value, MIN_RESPONSE_TOKENS), MAX_RESPONSE_TOKENS_LIMIT)
 
 
 def get_server_port() -> int:
@@ -326,8 +380,63 @@ def ask_it_agent(client: Any, message: str, history: Any) -> str:
     return response.choices[0].message.content or "I could not generate a response."
 
 
-def format_runtime_error(exc: Exception) -> str:
+def ask_ollama_agent(
+    message: str,
+    history: Any,
+    urlopen_func=urllib.request.urlopen,
+) -> str:
+    payload = {
+        "model": get_ollama_model_name(),
+        "messages": build_messages(message, history),
+        "stream": False,
+        "keep_alive": get_ollama_keep_alive(),
+        "options": {
+            "num_predict": get_max_response_tokens(),
+            "temperature": 0.25,
+        },
+    }
+    request = urllib.request.Request(
+        f"{get_ollama_base_url()}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urlopen_func(request, timeout=get_ollama_timeout_seconds()) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.URLError as exc:
+        raise RuntimeError("Ollama is not reachable on the configured local URL.") from exc
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Ollama returned a response that was not valid JSON.") from exc
+
+    if "error" in data:
+        raise RuntimeError("Ollama returned an error. Check that the model is pulled.")
+
+    message_data = data.get("message")
+    if isinstance(message_data, dict):
+        content = message_data.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+
+    return "I could not generate a response."
+
+
+def format_runtime_error(exc: Exception, provider: str) -> str:
     LOGGER.exception("IT support agent request failed: %s", exc.__class__.__name__)
+
+    if provider == "ollama":
+        return (
+            "I could not contact the local Ollama service right now.\n\n"
+            "Checklist:\n"
+            "- Confirm Ollama is installed and running.\n"
+            f"- Confirm the model is available with `ollama pull {get_ollama_model_name()}`.\n"
+            f"- Confirm `OLLAMA_BASE_URL` points to `{get_ollama_base_url()}`.\n"
+            "- Try again after fixing the issue."
+        )
 
     return (
         "I could not contact the AI service right now.\n\n"
@@ -339,7 +448,12 @@ def format_runtime_error(exc: Exception) -> str:
     )
 
 
-def chat(message: str, history: Any, client_factory=create_openai_client) -> str:
+def chat(
+    message: str,
+    history: Any,
+    client_factory=create_openai_client,
+    ollama_urlopen_func=urllib.request.urlopen,
+) -> str:
     if not isinstance(message, str) or not message.strip():
         return "Please describe the IT issue, including the affected device, app, and what changed recently."
 
@@ -356,7 +470,16 @@ def chat(message: str, history: Any, client_factory=create_openai_client) -> str
             "the most relevant error text, device/app name, and what you already tried."
         )
 
-    if not os.getenv("OPENAI_API_KEY"):
+    provider_setting = get_provider_setting()
+    if not is_supported_provider(provider_setting):
+        return (
+            f"Unsupported `AI_PROVIDER`: `{provider_setting}`.\n\n"
+            "Use one of: `auto`, `openai`, or `ollama`."
+        )
+
+    provider = resolve_provider()
+
+    if provider == "openai" and not os.getenv("OPENAI_API_KEY"):
         return (
             "Missing `OPENAI_API_KEY`.\n\n"
             "Checklist:\n"
@@ -366,9 +489,12 @@ def chat(message: str, history: Any, client_factory=create_openai_client) -> str
         )
 
     try:
+        if provider == "ollama":
+            return ask_ollama_agent(message, history, urlopen_func=ollama_urlopen_func)
+
         return ask_it_agent(client_factory(), message, history)
     except Exception as exc:
-        return format_runtime_error(exc)
+        return format_runtime_error(exc, provider)
 
 
 def build_demo() -> Any:
@@ -383,7 +509,8 @@ def build_demo() -> Any:
         fn=chat,
         title="IT Support Agent",
         description=(
-            "Describe the issue, the affected device or app, and what you have already tried."
+            "Describe the issue, the affected device or app, and what you have already tried. "
+            "Supports OpenAI or local Ollama."
         ),
         examples=[
             "My Windows 11 laptop is connected to Wi-Fi, but the internet is not working.",
