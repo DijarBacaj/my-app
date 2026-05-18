@@ -1,2 +1,60 @@
-You have to add an .env file and write
-your OPENAI API Token
+# IT Support Agent
+
+A Gradio chatbot that uses OpenAI to troubleshoot common IT support issues for a small company.
+
+## What It Does
+
+- Guides users through safe, step-by-step troubleshooting.
+- Uses the current chat history as short-term session memory.
+- Detects escalation signals like malware, account compromise, data loss, outages, and physical danger.
+- Avoids asking for passwords, MFA codes, recovery codes, private keys, or full API keys.
+- Ends each answer with a short checklist.
+
+Session memory is not saved to disk. It is rebuilt from the visible chat history each turn, and users can type `reset memory` to make the assistant ignore earlier context.
+
+## Setup
+
+Create and activate a virtual environment:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Install dependencies:
+
+```powershell
+pip install -r requirements.txt
+```
+
+Create a `.env` file in the project folder:
+
+```env
+OPENAI_API_KEY=your_api_key_here
+```
+
+Optional model override:
+
+```env
+OPENAI_MODEL=gpt-4o-mini
+```
+
+Optional local port override:
+
+```env
+GRADIO_SERVER_PORT=7861
+```
+
+## Run
+
+```powershell
+python it_support_agent.py
+```
+
+Gradio will print a local URL. Open it in your browser and describe the IT issue.
+
+## Test
+
+```powershell
+python -m unittest
+```
