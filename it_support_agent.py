@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from typing import Any
@@ -5,6 +6,12 @@ from typing import Any
 
 DEFAULT_MODEL = "gpt-4o-mini"
 MAX_HISTORY_MESSAGES = 16
+DEFAULT_MAX_INPUT_CHARS = 4000
+DEFAULT_MAX_RESPONSE_TOKENS = 600
+MIN_RESPONSE_TOKENS = 128
+MAX_RESPONSE_TOKENS_LIMIT = 2000
+
+LOGGER = logging.getLogger(__name__)
 
 RESET_MEMORY_COMMANDS = {
     "clear memory",
@@ -76,6 +83,50 @@ RISK_PATTERNS = {
     "possible physical danger": r"\bsmoke\b|\bburning smell\b|\bsparks?\b|\boverheat(?:ing)?\b",
 }
 
+OPENAI_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+BEARER_TOKEN_PATTERN = re.compile(
+    r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{12,}"
+)
+EMAIL_PATTERN = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+)
+SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b(?P<label>"
+    r"openai[_ -]?api[_ -]?key|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|"
+    r"bearer[_ -]?token|secret|password|pass|pwd|mfa[_ -]?code|2fa[_ -]?code|"
+    r"verification[_ -]?code|recovery[_ -]?code"
+    r")\s*(?P<separator>[:=]|\bis\b|\bwas\b)\s*(?P<value>['\"]?[^\s,;]{4,}['\"]?)"
+)
+
+
+def redact_sensitive_text(text: str) -> str:
+    redacted = OPENAI_KEY_PATTERN.sub("[REDACTED_OPENAI_KEY]", text)
+    redacted = BEARER_TOKEN_PATTERN.sub("Bearer [REDACTED]", redacted)
+    redacted = EMAIL_PATTERN.sub("[REDACTED_EMAIL]", redacted)
+
+    def replace_assignment(match: re.Match[str]) -> str:
+        label = match.group("label")
+        separator = match.group("separator")
+        spacing = " " if separator.lower() in {"is", "was"} else ""
+        return f"{label}{spacing}{separator}{spacing}[REDACTED]"
+
+    return SENSITIVE_ASSIGNMENT_PATTERN.sub(replace_assignment, redacted)
+
+
+def clamp_int_env(
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+
+    return min(max(value, minimum), maximum)
+
 
 def is_memory_reset_message(text: str) -> bool:
     return re.sub(r"\s+", " ", text.strip().lower()) in RESET_MEMORY_COMMANDS
@@ -94,7 +145,7 @@ def normalize_history(history: Any) -> list[dict[str, str]]:
         if role in {"user", "assistant"} and isinstance(content, str):
             cleaned = content.strip()
             if cleaned:
-                messages.append({"role": role, "content": cleaned})
+                messages.append({"role": role, "content": redact_sensitive_text(cleaned)})
 
     last_reset_index = None
     for index, item in enumerate(messages):
@@ -182,7 +233,7 @@ def detect_risk_flags(text: str) -> list[str]:
 
 
 def build_messages(message: str, history: Any) -> list[dict[str, str]]:
-    current_issue = message.strip()
+    current_issue = redact_sensitive_text(message.strip())
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     session_memory = build_session_memory(history)
@@ -227,6 +278,19 @@ def get_model_name() -> str:
     return os.getenv("OPENAI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
 
+def get_max_input_chars() -> int:
+    return clamp_int_env("MAX_INPUT_CHARS", DEFAULT_MAX_INPUT_CHARS, 500, 12000)
+
+
+def get_max_response_tokens() -> int:
+    return clamp_int_env(
+        "OPENAI_MAX_RESPONSE_TOKENS",
+        DEFAULT_MAX_RESPONSE_TOKENS,
+        MIN_RESPONSE_TOKENS,
+        MAX_RESPONSE_TOKENS_LIMIT,
+    )
+
+
 def get_server_port() -> int:
     raw_port = os.getenv("GRADIO_SERVER_PORT", "7860").strip()
     try:
@@ -254,20 +318,16 @@ def ask_it_agent(client: Any, message: str, history: Any) -> str:
     response = client.chat.completions.create(
         model=get_model_name(),
         messages=build_messages(message, history),
+        max_completion_tokens=get_max_response_tokens(),
+        store=False,
         temperature=0.25,
+        timeout=30,
     )
     return response.choices[0].message.content or "I could not generate a response."
 
 
 def format_runtime_error(exc: Exception) -> str:
-    detail = str(exc).strip()
-    if len(detail) > 240:
-        detail = detail[:237].rstrip() + "..."
-
-    if detail:
-        detail = f"\n\nTechnical detail: {exc.__class__.__name__}: {detail}"
-    else:
-        detail = f"\n\nTechnical detail: {exc.__class__.__name__}"
+    LOGGER.exception("IT support agent request failed: %s", exc.__class__.__name__)
 
     return (
         "I could not contact the AI service right now.\n\n"
@@ -276,7 +336,6 @@ def format_runtime_error(exc: Exception) -> str:
         "- Confirm dependencies are installed with `pip install -r requirements.txt`.\n"
         "- Confirm your network connection is working.\n"
         "- Try again after fixing the issue."
-        f"{detail}"
     )
 
 
@@ -288,6 +347,13 @@ def chat(message: str, history: Any, client_factory=create_openai_client) -> str
         return (
             "Memory reset for future replies in this chat. "
             "Use the clear-chat button too if you want to remove the visible conversation."
+        )
+
+    if len(message) > get_max_input_chars():
+        return (
+            f"That message is too long for this low-cost support chat. "
+            f"Please keep it under {get_max_input_chars()} characters and include only "
+            "the most relevant error text, device/app name, and what you already tried."
         )
 
     if not os.getenv("OPENAI_API_KEY"):
@@ -326,6 +392,9 @@ def build_demo() -> Any:
             "I clicked a suspicious email link and entered my Microsoft 365 username.",
             "Reset memory",
         ],
+        cache_examples=False,
+        flagging_mode="never",
+        save_history=False,
     )
 
 
@@ -338,6 +407,7 @@ def main() -> None:
         ) from exc
 
     load_dotenv()
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "WARNING").upper())
     build_demo().launch(server_name="127.0.0.1", server_port=get_server_port())
 
 
