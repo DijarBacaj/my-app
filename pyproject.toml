@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi==0.136.1",
-  "gradio==6.16.0",
+  "gradio==6.25.0",
   "openai==2.37.0",
   "python-dotenv==1.2.2",
   "uvicorn==0.47.0",
