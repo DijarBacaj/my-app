@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "it-support-chatbot"
+version = "0.2.0"
+description = "A privacy-conscious, production-hardened IT support chatbot."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi==0.136.1",
+  "gradio==6.16.0",
+  "openai==2.37.0",
+  "python-dotenv==1.2.2",
+  "uvicorn==0.47.0",
+]
+
+[project.scripts]
+it-support-agent = "it_support_agent:main"
+
+[tool.setuptools]
+py-modules = ["it_support_agent", "run_ollama_agent"]
+
+[tool.setuptools.packages.find]
+include = ["it_support*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501", "F403", "F405", "SIM117"]
+
+[tool.bandit]
+exclude_dirs = [".venv", "tests"]
+skips = ["B101"]
